@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# The desktop app (Tauri) is its own workspace: its webview dependencies stay out of the engine's builds.
+exclude = ["desktop"]
+
+[workspace.package]
+version = "0.9.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ollaya-dev/ollaya"
+rust-version = "1.90"
+
+[workspace.dependencies]
+ollaya-api = { path = "crates/ollaya-api" }
+ollaya-decision = { path = "crates/ollaya-decision" }
+ollaya-lang = { path = "crates/ollaya-lang" }
+ollaya-mlx = { path = "crates/ollaya-mlx" }
+ollaya-mlx-sys = { path = "crates/ollaya-mlx-sys" }
+ollaya-registry = { path = "crates/ollaya-registry" }
+ollaya-runner = { path = "crates/ollaya-runner" }
+ollaya-server = { path = "crates/ollaya-server" }
+
+anyhow = "1.0.104"
+# Images sent to vision models (`/api/decide` `images`).
+base64 = "0.22.1"
+axum = "0.8.9"
+bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dirs = "7.0.0"
+futures-util = "0.3.34"
+hex = "0.4.3"
+indicatif = "0.18.6"
+# Loads llama.cpp's shared libraries (lib/ollaya/llama) in GGUF runners.
+libloading = "0.9.0"
+reqwest = { version = "0.13.5", features = ["json", "stream"] }
+# The official MCP SDK (`ollaya mcp`): stdio and streamable HTTP servers.
+rmcp = { version = "3.4.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rustyline = "18.0.1"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"
+tower-http = { version = "0.7.1", features = ["cors"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+indexmap = { version = "2.14.2", features = ["serde"] }
+ndarray = "0.17.2"
+# Decodes PNG images for vision models, as PIL reads them.
+png = "0.18.0"
+serde = { version = "1.0", features = ["derive"] }
+# preserve_order: criteria and answers must keep the caller's key order, as Python dicts do.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.20"
+# Pure-Rust regex backend keeps the binary free of C dependencies; the golden encoding
+# tests prove it tokenizes identically to the Python (onig) build laya uses.
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
+# ort is a release candidate with breaking renames between RCs: pin it exactly.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "api-24"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

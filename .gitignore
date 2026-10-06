@@ -1,0 +1,19 @@
+/target/
+**/*.rs.bk
+
+# Python build-time tooling (convert/)
+.venv/
+__pycache__/
+*.egg-info/
+
+# Conversion outputs and downloaded weights never go in git
+/convert/out/
+*.onnx
+*.onnx.data
+*.safetensors
+
+# Derived registry blobs are build outputs (package.py); manifests are tracked.
+/registry/blobs/
+
+# Agent worktrees (Claude Code)
+/.claude/worktrees/

@@ -1,0 +1,129 @@
+//! Manifests: Docker distribution v2 (schema 2), with Ollaya's own layer media types.
+//!
+//! Every layer is content-addressed by sha256. A descriptor may list `urls` (the OCI "foreign
+//! layer" field): Ollaya uses them to fetch weights straight from the author's Hugging Face
+//! repository, so the registry only ever serves manifests and small derived files.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+pub const MANIFEST_V2: &str = "application/vnd.docker.distribution.manifest.v2+json";
+
+pub mod media {
+    pub const CONFIG: &str = "application/vnd.ollaya.config.v1+json";
+    /// ONNX graph. `org.ollaya.precision` says which precision it computes in.
+    pub const GRAPH_ONNX: &str = "application/vnd.ollaya.graph.onnx";
+    /// Weights file a graph references by its blob file name (ONNX external data).
+    pub const WEIGHTS: &str = "application/vnd.ollaya.weights";
+    pub const TOKENIZER: &str = "application/vnd.ollaya.tokenizer";
+    pub const DECISION: &str = "application/vnd.ollaya.decision";
+    pub const CALIBRATION: &str = "application/vnd.ollaya.calibration";
+    /// A question schema baked into a derived model (Modelfile `QUESTIONS`).
+    pub const QUESTIONS: &str = "application/vnd.ollaya.questions";
+    /// Routing rules: this model dispatches each request to one of several other models.
+    pub const ROUTER: &str = "application/vnd.ollaya.router";
+    pub const PARAMS: &str = "application/vnd.ollaya.params";
+    pub const LICENSE: &str = "application/vnd.ollaya.license";
+    pub const README: &str = "application/vnd.ollaya.readme";
+    /// The network the MLX engine builds from the weights layer: hyperparameters and tensor
+    /// names, derived from the author's config (`crates/ollaya-runner/src/mlx/arch.rs`).
+    pub const ARCH: &str = "application/vnd.ollaya.arch";
+    /// A GGUF file (weights, tokenizer and chat template) that llama.cpp loads. It comes unmodified
+    /// from the author's repository; `org.ollaya.quantization` names its type (`Q4_0`, `Q8_0`).
+    pub const GGUF: &str = "application/vnd.ollaya.weights.gguf";
+}
+
+pub const ANNOTATION_PRECISION: &str = "org.ollaya.precision";
+/// What a graph layer computes when a model has more than one: `vision` for a vision model's
+/// image graph. Unset: the model's main graph.
+pub const ANNOTATION_GRAPH: &str = "org.ollaya.graph";
+pub const ANNOTATION_QUANTIZATION: &str = "org.ollaya.quantization";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Descriptor {
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Manifest {
+    pub schema_version: u32,
+    pub media_type: String,
+    pub config: Descriptor,
+    pub layers: Vec<Descriptor>,
+}
+
+/// The config blob: what `ollaya list` / `show` report about a model.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// `onnx`, `gguf`, or `router` for a model that only dispatches.
+    pub model_format: String,
+    pub family: String,
+    #[serde(default)]
+    pub parameter_size: String,
+    #[serde(default)]
+    pub context_length: u32,
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+    /// Where the weights come from, e.g. `huggingface.co/convaiinnovations/laya@<commit>`.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub license: String,
+    /// When the upstream checkpoint was published (YYYY-MM-DD), for `/v1/models`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
+    /// The engine that runs the model: `onnx` (the default) or `llama` (llama.cpp).
+    /// A client checks it before downloading anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// The sequence layout (`decision.json`'s), so a client can refuse a layout it cannot run
+    /// before downloading anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+}
+
+impl Manifest {
+    pub fn layers_of<'a>(
+        &'a self,
+        media_type: &'a str,
+    ) -> impl Iterator<Item = &'a Descriptor> + 'a {
+        self.layers
+            .iter()
+            .filter(move |l| l.media_type == media_type)
+    }
+
+    pub fn layer(&self, media_type: &str) -> Option<&Descriptor> {
+        self.layers.iter().find(|l| l.media_type == media_type)
+    }
+
+    /// Every blob the manifest needs locally, config included.
+    pub fn blobs(&self) -> impl Iterator<Item = &Descriptor> {
+        std::iter::once(&self.config).chain(self.layers.iter())
+    }
+
+    /// Total bytes of all blobs (what `ollaya list` shows as SIZE).
+    pub fn total_size(&self) -> u64 {
+        self.blobs().map(|d| d.size).sum()
+    }
+}
+
+/// `laya:latest`-style routing: which model answers, decided per request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Router {
+    /// Routing strategy; `script` routes on the state's script and language.
+    pub strategy: String,
+    /// Route name -> model name, e.g. `english` -> `laya:en`.
+    pub routes: BTreeMap<String, String>,
+    pub default: String,
+}

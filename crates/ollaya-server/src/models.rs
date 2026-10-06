@@ -1,0 +1,293 @@
+//! Model resolution: a name in the local store to what a runner needs to load it.
+
+use std::path::PathBuf;
+
+use ollaya_decision::{Calibration, CalibrationFile};
+use ollaya_registry::manifest::{
+    ANNOTATION_GRAPH, ANNOTATION_PRECISION, ANNOTATION_QUANTIZATION, media,
+};
+use ollaya_registry::{Entry, ModelConfig, ModelName, Router, Store};
+use serde_json::Value;
+
+use crate::Error;
+
+/// Files a runner loads, all inside the blob store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunnerFiles {
+    pub graph_fp32: Option<PathBuf>,
+    pub graph_fp16: Option<PathBuf>,
+    pub tokenizer: PathBuf,
+    pub decision: PathBuf,
+    /// The arch layer (models the MLX engine can run).
+    pub arch: Option<PathBuf>,
+    /// The weights file, passed with an arch layer.
+    pub weights: Option<PathBuf>,
+    /// A vision model's image graph.
+    pub vision_graph: Option<PathBuf>,
+}
+
+/// Files of a GGUF model, run by a llama.cpp runner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlamaFiles {
+    pub gguf: PathBuf,
+    pub decision: PathBuf,
+    /// The GGUF's type (`Q4_0`), from the layer's annotation.
+    pub quantization: String,
+}
+
+/// What loads a model: an ONNX Runtime runner, or a llama.cpp one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineFiles {
+    Onnx(RunnerFiles),
+    Llama(LlamaFiles),
+}
+
+impl EngineFiles {
+    /// The engine's name, as `ollaya show` prints it.
+    pub fn engine(&self) -> &'static str {
+        match self {
+            EngineFiles::Onnx(_) => "onnxruntime",
+            EngineFiles::Llama(_) => "llama.cpp",
+        }
+    }
+}
+
+/// A model that answers requests itself.
+#[derive(Debug, Clone)]
+pub struct Loadable {
+    pub name: ModelName,
+    /// Manifest digest: runners are keyed by content, so two tags of one model share a runner.
+    pub digest: String,
+    pub files: EngineFiles,
+    pub calibration: Calibration,
+    pub config: ModelConfig,
+    /// A question schema baked in with a Modelfile, used when a request brings none.
+    pub questions: Option<Value>,
+    /// Bytes on disk, for `ps` and scheduling.
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum Resolved {
+    Model(Box<Loadable>),
+    /// A router: the target is chosen per request.
+    Router {
+        name: ModelName,
+        digest: String,
+        router: Box<Router>,
+        config: Box<ModelConfig>,
+        questions: Option<Value>,
+    },
+}
+
+pub fn resolve(store: &Store, name: &ModelName) -> Result<Resolved, Error> {
+    let entry = store
+        .read_manifest(name)?
+        .ok_or_else(|| Error::ModelNotFound(name.to_string()))?;
+    resolve_entry(store, entry)
+}
+
+pub fn resolve_entry(store: &Store, entry: Entry) -> Result<Resolved, Error> {
+    let Entry {
+        name,
+        manifest,
+        digest,
+        ..
+    } = entry;
+    let config: ModelConfig = store.read_blob_json(&manifest.config)?;
+    let questions = match manifest.layer(media::QUESTIONS) {
+        Some(d) => Some(store.read_blob_json::<Value>(d)?),
+        None => None,
+    };
+    if let Some(router) = manifest.layer(media::ROUTER) {
+        let router = store.read_blob_json(router)?;
+        return Ok(Resolved::Router {
+            name,
+            digest,
+            router: Box::new(router),
+            config: Box::new(config),
+            questions,
+        });
+    }
+    if !matches!(config.model_format.as_str(), "" | "onnx" | "gguf") {
+        return Err(Error::Unsupported(format!(
+            "{name} is a {} model, which this build of ollaya cannot run",
+            config.model_format
+        )));
+    }
+    let blob = |media_type: &str| -> Result<PathBuf, Error> {
+        let d = manifest
+            .layer(media_type)
+            .ok_or_else(|| Error::Corrupt(format!("{name}: manifest has no {media_type} layer")))?;
+        Ok(store.blob_path(&d.digest)?)
+    };
+    let calibration = match manifest.layer(media::CALIBRATION) {
+        Some(d) => Calibration::from_file(&store.read_blob_json::<CalibrationFile>(d)?),
+        None => Calibration::default(),
+    };
+    if config.model_format == "gguf" {
+        let quantization = manifest
+            .layer(media::GGUF)
+            .and_then(|d| d.annotations.get(ANNOTATION_QUANTIZATION))
+            .cloned()
+            .unwrap_or_default();
+        let files = EngineFiles::Llama(LlamaFiles {
+            gguf: blob(media::GGUF)?,
+            decision: blob(media::DECISION)?,
+            quantization,
+        });
+        return Ok(Resolved::Model(Box::new(Loadable {
+            name,
+            digest,
+            files,
+            calibration,
+            config,
+            questions,
+            size: manifest.total_size(),
+        })));
+    }
+    let mut files = RunnerFiles {
+        graph_fp32: None,
+        graph_fp16: None,
+        tokenizer: blob(media::TOKENIZER)?,
+        decision: blob(media::DECISION)?,
+        arch: None,
+        weights: None,
+        vision_graph: None,
+    };
+    // MLX builds its network from one weights file; sharded weights stay on ONNX Runtime.
+    let weights: Vec<_> = manifest.layers_of(media::WEIGHTS).collect();
+    if let (Some(arch), [weights]) = (manifest.layer(media::ARCH), weights.as_slice()) {
+        files.arch = Some(store.blob_path(&arch.digest)?);
+        files.weights = Some(store.blob_path(&weights.digest)?);
+    }
+    for g in manifest.layers_of(media::GRAPH_ONNX) {
+        let path = store.blob_path(&g.digest)?;
+        if g.annotations.get(ANNOTATION_GRAPH).map(String::as_str) == Some("vision") {
+            files.vision_graph = Some(path);
+            continue;
+        }
+        match g.annotations.get(ANNOTATION_PRECISION).map(String::as_str) {
+            Some("fp16") => files.graph_fp16 = Some(path),
+            _ => files.graph_fp32 = Some(path),
+        }
+    }
+    // A precision-pinned tag (`laya:en-fp32`) keeps only the graph it names.
+    if let Some(params) = manifest.layer(media::PARAMS) {
+        let params: Value = store.read_blob_json(params)?;
+        match params["precision"].as_str() {
+            Some("fp32") => files.graph_fp16 = None,
+            Some("fp16") => files.graph_fp32 = None,
+            _ => {}
+        }
+    }
+    if files.graph_fp32.is_none() && files.graph_fp16.is_none() {
+        return Err(Error::Corrupt(format!("{name}: manifest has no graph")));
+    }
+    Ok(Resolved::Model(Box::new(Loadable {
+        name,
+        digest,
+        files: EngineFiles::Onnx(files),
+        calibration,
+        config,
+        questions,
+        size: manifest.total_size(),
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use ollaya_registry::manifest::{Descriptor, MANIFEST_V2, Manifest};
+
+    use super::*;
+
+    fn blob(store: &Store, media_type: &str, bytes: &[u8]) -> Descriptor {
+        Descriptor {
+            media_type: media_type.into(),
+            digest: store.write_blob(bytes).unwrap(),
+            size: bytes.len() as u64,
+            urls: vec![],
+            annotations: Default::default(),
+        }
+    }
+
+    /// A model with one fp32 graph, `weights` weights files and, with `arch`, an arch layer; with
+    /// `vision`, an image graph after the main one.
+    fn resolve_with(
+        weights: usize,
+        arch: bool,
+        vision: bool,
+    ) -> (RunnerFiles, Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let config = br#"{"model_format": "onnx", "family": "laya"}"#;
+        let mut layers = vec![
+            blob(&store, media::GRAPH_ONNX, b"graph"),
+            blob(&store, media::TOKENIZER, b"{}"),
+            blob(&store, media::DECISION, br#"{"layout": "laya-markers-v1"}"#),
+        ];
+        for i in 0..weights {
+            layers.push(blob(
+                &store,
+                media::WEIGHTS,
+                format!("weights {i}").as_bytes(),
+            ));
+        }
+        if arch {
+            layers.push(blob(&store, media::ARCH, br#"{"schema": 1}"#));
+        }
+        if vision {
+            let mut g = blob(&store, media::GRAPH_ONNX, b"vision graph");
+            g.annotations
+                .insert(ANNOTATION_GRAPH.into(), "vision".into());
+            layers.push(g);
+        }
+        let manifest = Manifest {
+            schema_version: 2,
+            media_type: MANIFEST_V2.into(),
+            config: blob(&store, media::CONFIG, config),
+            layers,
+        };
+        let name = ModelName::parse("laya:en").unwrap();
+        store
+            .write_manifest(&name, &serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        match resolve(&store, &name).unwrap() {
+            Resolved::Model(m) => match m.files {
+                EngineFiles::Onnx(f) => (f, store, dir),
+                EngineFiles::Llama(_) => panic!("not an ONNX model"),
+            },
+            Resolved::Router { .. } => panic!("not a router"),
+        }
+    }
+
+    #[test]
+    fn an_arch_layer_passes_the_weights_file_to_mlx() {
+        let (files, ..) = resolve_with(1, true, false);
+        assert!(files.arch.is_some() && files.weights.is_some());
+        // Without an arch layer, or with sharded weights, the model stays on ONNX Runtime.
+        for (files, ..) in [resolve_with(1, false, false), resolve_with(2, true, false)] {
+            assert!(files.arch.is_none() && files.weights.is_none());
+        }
+    }
+
+    #[test]
+    fn a_vision_graph_is_passed_on_its_own() {
+        let (files, store, _dir) = resolve_with(1, false, true);
+        let digest = |b: &[u8]| {
+            format!(
+                "sha256:{}",
+                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b))
+            )
+        };
+        assert_eq!(
+            files.graph_fp32,
+            Some(store.blob_path(&digest(b"graph")).unwrap())
+        );
+        assert_eq!(
+            files.vision_graph,
+            Some(store.blob_path(&digest(b"vision graph")).unwrap())
+        );
+        assert!(resolve_with(1, false, false).0.vision_graph.is_none());
+    }
+}

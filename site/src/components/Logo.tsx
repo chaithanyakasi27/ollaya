@@ -1,0 +1,57 @@
+/**
+ * Ollaya's mark: a minimal line-art owl (original artwork). Monochrome: inherits currentColor,
+ * so it works on light and dark backgrounds, from 16px favicons to the large closer section.
+ * Keep in sync with public/favicon.svg and public/static/logo.svg.
+ */
+export const OWL_PATHS = {
+  head: 'M6 5.5 10.5 9.5Q16 7.5 21.5 9.5L26 5.5V19Q26 27.5 16 27.5T6 19Z',
+  beak: 'M14.75 21 16 23l1.25-2',
+}
+
+export function LogoMark({ class: cls = 'size-8', label }: { class?: string; label?: string }) {
+  return (
+    <svg
+      class={cls}
+      viewBox="0 0 32 32"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      role={label ? 'img' : undefined}
+      aria-label={label}
+      aria-hidden={label ? undefined : 'true'}
+      focusable="false"
+    >
+      <path d={OWL_PATHS.head} />
+      <circle cx="11.5" cy="15.5" r="3.25" />
+      <circle cx="20.5" cy="15.5" r="3.25" />
+      <circle cx="11.5" cy="15.5" r="1.1" fill="currentColor" stroke="none" />
+      <circle cx="20.5" cy="15.5" r="1.1" fill="currentColor" stroke="none" />
+      <path d={OWL_PATHS.beak} />
+    </svg>
+  )
+}
+
+/**
+ * Mark + lowercase wordmark. The wordmark is the flex baseline and the mark is centred on its
+ * 28px line, so the header can baseline-align the nav links with the wordmark.
+ */
+export function Logo() {
+  return (
+    <span class="flex shrink-0 items-baseline gap-2 whitespace-nowrap text-fg">
+      {/* The owl sits 5px inside its 28px box; pull it out so its edge lines up with the page. */}
+      <LogoMark class="-ml-[5px] size-7 self-center" />
+      <span class="text-lg leading-7 font-medium tracking-tight">
+        ollaya
+        {/* vertical-align: middle centres the badge on the wordmark's x-height, whatever the font. */}
+        <span
+          class="ml-2 inline-block rounded-full border border-line-strong px-[7px] align-middle text-[11px] leading-[17px] font-medium tracking-normal text-muted"
+          title="Ollaya is new: expect rough edges, and please report what breaks on GitHub"
+        >
+          Beta
+        </span>
+      </span>
+    </span>
+  )
+}
